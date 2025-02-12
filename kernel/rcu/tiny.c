@@ -246,17 +246,6 @@ bool poll_state_synchronize_rcu(unsigned long oldstate)
 }
 EXPORT_SYMBOL_GPL(poll_state_synchronize_rcu);
 
-#ifdef CONFIG_KASAN_GENERIC
-void kvfree_call_rcu(struct rcu_head *head, void *ptr)
-{
-	if (head)
-		kasan_record_aux_stack(ptr);
-
-	__kvfree_call_rcu(head, ptr);
-}
-EXPORT_SYMBOL_GPL(kvfree_call_rcu);
-#endif
-
 #if IS_ENABLED(CONFIG_RCU_TORTURE_TEST)
 unsigned long long rcutorture_gather_gp_seqs(void)
 {
