@@ -4,15 +4,27 @@
 
 //! Provides the `RcuBox` type for Rust allocations that live for a grace period.
 
-use core::{ops::Deref, ptr::NonNull};
+use core::{
+    marker::PhantomData,
+    ops::Deref,
+    ptr::NonNull, //
+};
 
 use kernel::{
-    alloc::{self, AllocError},
+    alloc::{
+        self,
+        AllocError,
+        Allocator, //
+    },
     bindings,
     ffi::c_void,
     prelude::*,
-    sync::rcu::{ForeignOwnableRcu, Guard},
     types::ForeignOwnable,
+};
+
+use super::{
+    ForeignOwnableRcu,
+    Guard, //
 };
 
 /// A box that is freed with rcu.
@@ -21,30 +33,30 @@ use kernel::{
 ///
 /// # Invariants
 ///
-/// * The pointer is valid and references a pinned `RcuBoxInner<T>` allocated with `kmalloc`.
+/// * The pointer is valid and references a pinned `RcuBoxInner<T>` allocated with `A`.
 /// * This `RcuBox` holds exclusive permissions to rcu free the allocation.
-pub struct RcuBox<T: Send>(NonNull<RcuBoxInner<T>>);
+pub struct RcuBox<T: Send, A: Allocator>(NonNull<RcuBoxInner<T>>, PhantomData<A>);
 
 struct RcuBoxInner<T> {
     value: T,
     rcu_head: bindings::callback_head,
 }
 
-// Note that `T: Sync` is required since when moving an `RcuBox<T>`, the previous owner may still
-// access `&T` for one grace period.
+// Note that `T: Sync` is required since when moving an `RcuBox<T, A>`, the previous owner may
+// still access `&T` for one grace period.
 //
-// SAFETY: Ownership of the `RcuBox<T>` allows for `&T` and dropping the `T`, so `T: Send + Sync`
-// implies `RcuBox<T>: Send`.
-unsafe impl<T: Send + Sync> Send for RcuBox<T> {}
+// SAFETY: Ownership of the `RcuBox<T, A>` allows for `&T` and dropping the `T`, so `T: Send +
+// Sync` implies `RcuBox<T, A>: Send`.
+unsafe impl<T: Send + Sync, A: Allocator> Send for RcuBox<T, A> {}
 
-// SAFETY: `&RcuBox<T>` allows for no operations other than those permitted by `&T`, so `T: Sync`
-// implies `RcuBox<T>: Sync`.
-unsafe impl<T: Send + Sync> Sync for RcuBox<T> {}
+// SAFETY: `&RcuBox<T, A>` allows for no operations other than those permitted by `&T`, so `T:
+// Sync` implies `RcuBox<T, A>: Sync`.
+unsafe impl<T: Send + Sync, A: Allocator> Sync for RcuBox<T, A> {}
 
-impl<T: Send> RcuBox<T> {
+impl<T: Send, A: Allocator> RcuBox<T, A> {
     /// Create a new `RcuBox`.
     pub fn new(x: T, flags: alloc::Flags) -> Result<Self, AllocError> {
-        let b = KBox::new(
+        let b = Box::<_, A>::new(
             RcuBoxInner {
                 value: x,
                 rcu_head: Default::default(),
@@ -53,9 +65,9 @@ impl<T: Send> RcuBox<T> {
         )?;
 
         // INVARIANT:
-        // * The pointer contains a valid `RcuBoxInner` allocated with `kmalloc`.
+        // * The pointer contains a valid `RcuBoxInner` allocated with `A`.
         // * We just allocated it, so we own free permissions.
-        Ok(RcuBox(NonNull::from(KBox::leak(b))))
+        Ok(RcuBox(NonNull::from(Box::leak(b)), PhantomData))
     }
 
     /// Access the value for a grace period.
@@ -66,7 +78,7 @@ impl<T: Send> RcuBox<T> {
     }
 }
 
-impl<T: Send> Deref for RcuBox<T> {
+impl<T: Send, A: Allocator> Deref for RcuBox<T, A> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: While the `RcuBox<T>` exists, the value remains valid.
@@ -75,10 +87,10 @@ impl<T: Send> Deref for RcuBox<T> {
 }
 
 // SAFETY:
-// * The `RcuBoxInner<T>` was allocated with `kmalloc`.
+// * The `RcuBoxInner<T>` was allocated with `A`.
 // * `NonNull::as_ptr` returns a non-null pointer.
-unsafe impl<T: Send + 'static> ForeignOwnable for RcuBox<T> {
-    const FOREIGN_ALIGN: usize = <KBox<RcuBoxInner<T>> as ForeignOwnable>::FOREIGN_ALIGN;
+unsafe impl<T: Send + 'static, A: Allocator> ForeignOwnable for RcuBox<T, A> {
+    const FOREIGN_ALIGN: usize = <Box<RcuBoxInner<T>, A> as ForeignOwnable>::FOREIGN_ALIGN;
 
     type Borrowed<'a> = &'a T;
     type BorrowedMut<'a> = &'a T;
@@ -88,9 +100,9 @@ unsafe impl<T: Send + 'static> ForeignOwnable for RcuBox<T> {
     }
 
     unsafe fn from_foreign(ptr: *mut c_void) -> Self {
-        // INVARIANT: Pointer returned by `into_foreign` carries same invariants as `RcuBox<T>`.
+        // INVARIANT: Pointer returned by `into_foreign, A` carries same invariants as `RcuBox<T>`.
         // SAFETY: `into_foreign` never returns a null pointer.
-        Self(unsafe { NonNull::new_unchecked(ptr.cast()) })
+        Self(unsafe { NonNull::new_unchecked(ptr.cast()) }, PhantomData)
     }
 
     unsafe fn borrow<'a>(ptr: *mut c_void) -> &'a T {
@@ -104,7 +116,7 @@ unsafe impl<T: Send + 'static> ForeignOwnable for RcuBox<T> {
     }
 }
 
-impl<T: Send + 'static> ForeignOwnableRcu for RcuBox<T> {
+impl<T: Send + 'static, A: Allocator> ForeignOwnableRcu for RcuBox<T, A> {
     type RcuBorrowed<'a> = &'a T;
 
     unsafe fn rcu_borrow<'a>(ptr: *mut c_void) -> &'a T {
@@ -114,7 +126,7 @@ impl<T: Send + 'static> ForeignOwnableRcu for RcuBox<T> {
     }
 }
 
-impl<T: Send> Drop for RcuBox<T> {
+impl<T: Send, A: Allocator> Drop for RcuBox<T, A> {
     fn drop(&mut self) {
         // SAFETY: The `rcu_head` field is in-bounds of a valid allocation.
         let rcu_head = unsafe { &raw mut (*self.0.as_ptr()).rcu_head };
@@ -122,9 +134,11 @@ impl<T: Send> Drop for RcuBox<T> {
             // SAFETY: `rcu_head` is the `rcu_head` field of `RcuBoxInner<T>`. All users will be
             // gone in an rcu grace period. This is the destructor, so we may pass ownership of the
             // allocation.
-            unsafe { bindings::call_rcu(rcu_head, Some(drop_rcu_box::<T>)) };
+            unsafe { bindings::call_rcu(rcu_head, Some(drop_rcu_box::<T, A>)) };
         } else {
             // SAFETY: All users will be gone in an rcu grace period.
+            // TODO: We are luckily since `kvfree_call_rcu()` works on both kmalloc and vmalloc,
+            // maybe a new `Allocator` method is needed.
             unsafe { bindings::kvfree_call_rcu(rcu_head, self.0.as_ptr().cast()) };
         }
     }
@@ -135,11 +149,35 @@ impl<T: Send> Drop for RcuBox<T> {
 /// # Safety
 ///
 /// `head` references the `rcu_head` field of an `RcuBoxInner<T>` that has no references to it.
-/// Ownership of the `KBox<RcuBoxInner<T>>` must be passed.
-unsafe extern "C" fn drop_rcu_box<T>(head: *mut bindings::callback_head) {
+/// Ownership of the `Box<RcuBoxInner<T>, A>` must be passed.
+unsafe extern "C" fn drop_rcu_box<T, A: Allocator>(head: *mut bindings::callback_head) {
     // SAFETY: Caller provides a pointer to the `rcu_head` field of a `RcuBoxInner<T>`.
     let box_inner = unsafe { crate::container_of!(head, RcuBoxInner<T>, rcu_head) };
 
     // SAFETY: Caller ensures exclusive access and passed ownership.
-    drop(unsafe { KBox::from_raw(box_inner) });
+    drop(unsafe { Box::<_, A>::from_raw(box_inner) });
+}
+
+#[kunit_tests(rust_rcu_box)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rcu_box_basic() -> Result {
+        let rb = RcuBox::<_, alloc::allocator::Kmalloc>::new(42i32, alloc::flags::GFP_KERNEL)?;
+
+        assert_eq!(*rb, 42);
+        assert_eq!(*rb.with_rcu(&Guard::new()), 42);
+
+        drop(rb);
+
+        let rb = RcuBox::<_, alloc::allocator::Vmalloc>::new(42i32, alloc::flags::GFP_KERNEL)?;
+
+        assert_eq!(*rb, 42);
+        assert_eq!(*rb.with_rcu(&Guard::new()), 42);
+
+        drop(rb);
+
+        Ok(())
+    }
 }
