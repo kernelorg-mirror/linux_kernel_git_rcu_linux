@@ -33,13 +33,16 @@ use super::{
 ///
 /// # Invariants
 ///
-/// * The pointer is valid and references a pinned `RcuBoxInner<T>` allocated with `A`.
+/// * The pointer is valid and references a pinned `WithRcuHead<T>` allocated with `A`.
 /// * This `RcuBox` holds exclusive permissions to rcu free the allocation.
-pub struct RcuBox<T: Send, A: Allocator>(NonNull<RcuBoxInner<T>>, PhantomData<A>);
+pub struct RcuBox<T: Send, A: Allocator>(NonNull<WithRcuHead<T>>, PhantomData<A>);
 
-struct RcuBoxInner<T> {
-    value: T,
+#[repr(C)]
+#[pin_data]
+struct WithRcuHead<T> {
     rcu_head: bindings::callback_head,
+    #[pin]
+    value: T,
 }
 
 // Note that `T: Sync` is required since when moving an `RcuBox<T, A>`, the previous owner may
@@ -57,7 +60,7 @@ impl<T: Send, A: Allocator> RcuBox<T, A> {
     /// Create a new `RcuBox`.
     pub fn new(x: T, flags: alloc::Flags) -> Result<Self, AllocError> {
         let b = Box::<_, A>::new(
-            RcuBoxInner {
+            WithRcuHead {
                 value: x,
                 rcu_head: Default::default(),
             },
@@ -65,7 +68,7 @@ impl<T: Send, A: Allocator> RcuBox<T, A> {
         )?;
 
         // INVARIANT:
-        // * The pointer contains a valid `RcuBoxInner` allocated with `A`.
+        // * The pointer contains a valid `WithRcuHead` allocated with `A`.
         // * We just allocated it, so we own free permissions.
         Ok(RcuBox(NonNull::from(Box::leak(b)), PhantomData))
     }
@@ -87,10 +90,10 @@ impl<T: Send, A: Allocator> Deref for RcuBox<T, A> {
 }
 
 // SAFETY:
-// * The `RcuBoxInner<T>` was allocated with `A`.
+// * The `WithRcuHead<T>` was allocated with `A`.
 // * `NonNull::as_ptr` returns a non-null pointer.
 unsafe impl<T: Send + 'static, A: Allocator> ForeignOwnable for RcuBox<T, A> {
-    const FOREIGN_ALIGN: usize = <Box<RcuBoxInner<T>, A> as ForeignOwnable>::FOREIGN_ALIGN;
+    const FOREIGN_ALIGN: usize = <Box<WithRcuHead<T>, A> as ForeignOwnable>::FOREIGN_ALIGN;
 
     type Borrowed<'a> = &'a T;
     type BorrowedMut<'a> = &'a T;
@@ -107,7 +110,7 @@ unsafe impl<T: Send + 'static, A: Allocator> ForeignOwnable for RcuBox<T, A> {
 
     unsafe fn borrow<'a>(ptr: *mut c_void) -> &'a T {
         // SAFETY: Caller ensures that `'a` is short enough.
-        unsafe { &(*ptr.cast::<RcuBoxInner<T>>()).value }
+        unsafe { &(*ptr.cast::<WithRcuHead<T>>()).value }
     }
 
     unsafe fn borrow_mut<'a>(ptr: *mut c_void) -> &'a T {
@@ -122,7 +125,7 @@ impl<T: Send + 'static, A: Allocator> ForeignOwnableRcu for RcuBox<T, A> {
     unsafe fn rcu_borrow<'a>(ptr: *mut c_void) -> &'a T {
         // SAFETY: `RcuBox::drop` can only run after `from_foreign` is called, and the value is
         // valid until `RcuBox::drop` plus one grace period.
-        unsafe { &(*ptr.cast::<RcuBoxInner<T>>()).value }
+        unsafe { &(*ptr.cast::<WithRcuHead<T>>()).value }
     }
 }
 
@@ -131,7 +134,7 @@ impl<T: Send, A: Allocator> Drop for RcuBox<T, A> {
         // SAFETY: The `rcu_head` field is in-bounds of a valid allocation.
         let rcu_head = unsafe { &raw mut (*self.0.as_ptr()).rcu_head };
         if core::mem::needs_drop::<T>() {
-            // SAFETY: `rcu_head` is the `rcu_head` field of `RcuBoxInner<T>`. All users will be
+            // SAFETY: `rcu_head` is the `rcu_head` field of `WithRcuHead<T>`. All users will be
             // gone in an rcu grace period. This is the destructor, so we may pass ownership of the
             // allocation.
             unsafe { bindings::call_rcu(rcu_head, Some(drop_rcu_box::<T, A>)) };
@@ -144,15 +147,15 @@ impl<T: Send, A: Allocator> Drop for RcuBox<T, A> {
     }
 }
 
-/// Free this `RcuBoxInner<T>`.
+/// Free this `WithRcuHead<T>`.
 ///
 /// # Safety
 ///
-/// `head` references the `rcu_head` field of an `RcuBoxInner<T>` that has no references to it.
-/// Ownership of the `Box<RcuBoxInner<T>, A>` must be passed.
+/// `head` references the `rcu_head` field of an `WithRcuHead<T>` that has no references to it.
+/// Ownership of the `Box<WithRcuHead<T>, A>` must be passed.
 unsafe extern "C" fn drop_rcu_box<T, A: Allocator>(head: *mut bindings::callback_head) {
-    // SAFETY: Caller provides a pointer to the `rcu_head` field of a `RcuBoxInner<T>`.
-    let box_inner = unsafe { crate::container_of!(head, RcuBoxInner<T>, rcu_head) };
+    // SAFETY: Caller provides a pointer to the `rcu_head` field of a `WithRcuHead<T>`.
+    let box_inner = unsafe { crate::container_of!(head, WithRcuHead<T>, rcu_head) };
 
     // SAFETY: Caller ensures exclusive access and passed ownership.
     drop(unsafe { Box::<_, A>::from_raw(box_inner) });
